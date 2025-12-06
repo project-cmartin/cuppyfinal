@@ -1,0 +1,325 @@
+import network
+import socket
+import time
+import machine
+import ubinascii
+import framebuf # Needed for oled.blit to display bitmaps
+
+from umqtt.robust import MQTTClient
+from machine import Pin, I2C
+from ssd1306 import SSD1306_I2C
+
+# --- Define Variables ---
+WIFI_SSID = "YOUR_SSID" # <--- CHANGE THIS
+WIFI_PASSWORD = "YOUR_PASSWORD" # <--- CHANGE THIS
+YOUR_NAME = "UNIQUE_NAME"   # <--- CHANGE THIS (Use your actual name or a unique ID)
+
+MQTT_BROKER = "broker.hivemq.com"
+
+# --- TOPICS ---
+COMMAND_TOPIC = b"wyohack/" + YOUR_NAME.encode('utf-8') + b"/display/command"
+STATUS_TOPIC = b"wyohack/" + YOUR_NAME.encode('utf-8') + b"/display/status"
+IMAGE_TOPIC = b"wyohack/" + YOUR_NAME.encode('utf-8') + b"/display/image" # NEW: Topic for image commands
+
+# --- SSD1306 I2C Setup ---
+DISPLAY_WIDTH = 128
+DISPLAY_HEIGHT = 64
+I2C_SCL_PIN = 22 # Example for ESP32
+I2C_SDA_PIN = 21 # Example for ESP32
+
+# Initialize I2C and OLED Display
+try:
+    i2c = I2C(0, scl=Pin(I2C_SCL_PIN), sda=Pin(I2C_SDA_PIN))
+    oled = SSD1306_I2C(DISPLAY_WIDTH, DISPLAY_HEIGHT, i2c)
+    print("OLED Display Initialized successfully.")
+except Exception as e:
+    print(f"Error initializing OLED: {e}")
+    oled = None 
+
+# Initial Display State
+current_display_text = "Waking Up ..."                           #can change for initializing setup display text
+# Display the initial message (if oled object exists)
+if oled:
+    oled.fill(0)  # Clear the screen
+    oled.text(current_display_text, 0, 0)
+    oled.show()
+
+# --- IMAGE BITMAPS (16x16) ---
+# Each bitmap is 16x16 pixels (32 bytes total, 1-bit color depth)
+# This data is in MONO_HLSB format (High-to-Low Stroke Bit) for oled.blit.
+
+EMOTION_WIDTH = 16
+EMOTION_HEIGHT = 16
+LINE_HEIGHT = 10 # 8 pixels for the font + 2 pixels for spacing
+
+# Global variable to store the currently displayed emotion bitmap data
+# Starting with a blank image
+current_emotion_bitmap_data = b'\x00' * 32 
+
+def get_emotion_bitmap(emotion_name):
+    """Maps an emotion string to a 16x16 pixel bitmap (32 bytes)."""
+
+    # --- SIMPLIFIED BITMAPS (16x16 pixels = 32 bytes) ---
+    # These are designed for simple, easily recognizable faces using the MONO_HLSB format.
+    
+    # 16x16 (32 bytes) - Simple Happy Face (Smiley)
+    HAPPY_BMP = (
+        b'\x00\x00\x07\xe0\x1f\xf8\x3e\x7c\x78\x1e\x70\x0e\x70\x0e\x70\x0e'
+        b'\x70\x0e\x78\x1e\x3e\x7c\x1f\xf8\x07\xe0\x00\x00\x00\x00\x00\x00'
+    )
+
+    # 16x16 (32 bytes) - Simple Sad Face (Frowny)
+    SAD_BMP = (
+        b'\x00\x00\x07\xe0\x1f\xf8\x3e\x7c\x78\x1e\x70\x0e\x70\x0e\x7c\x1e'
+        b'\x7c\x1e\x70\x0e\x3e\x7c\x1f\xf8\x07\xe0\x00\x00\x00\x00\x00\x00'
+    )
+
+    # 16x16 (32 bytes) - Neutral/Blank Image
+    CLEAR_BMP = b'\x00' * 32 
+
+    # Map the command to the bitmap data
+    emotion_map = {
+        "happy": HAPPY_BMP,
+        "sad": SAD_BMP,
+        "clear": CLEAR_BMP,
+        "neutral": CLEAR_BMP
+    }
+    
+    # Return the bitmap or None if not found
+    return emotion_map.get(emotion_name.lower().strip(), None)
+
+
+# --- UTILITY FUNCTIONS ---
+
+def wifi_connect(WIFI_SSID, WIFI_PASSWORD):
+    """Connects to the Wi-Fi network."""
+    # Create a WLAN interface object for Station mode (connecting to a router)
+    wlan = network.WLAN(network.STA_IF)
+    # Activate the Wi-Fi interface
+    print("Activating WiFi interface...")
+    wlan.active(True)
+    time.sleep(1) # Allow some time for activation
+    # Check if already connected (useful if script restarts)
+    if not wlan.isconnected():
+        print("Connecting to network:", WIFI_SSID)
+    # Start the connection attempt
+        wlan.connect (WIFI_SSID, WIFI_PASSWORD)
+    # Wait for connection with a timeout (e.g., 20 seconds)
+        max_wait_seconds = 20
+        start_time = time.ticks_ms() # Get start time in milliseconds
+        print("Waiting for connection", end="")
+        while not wlan.isconnected() and time.ticks_diff(time.ticks_ms(), start_time) < max_wait_seconds * 1000:
+            print(".", end="")
+            time.sleep(1) # Wait 1 second between checks
+        print() # Print a newline after the dots/timeout
+    else:
+        print("Already connected to:", WIFI_SSID)
+    # Verify Connection and Print IP Address
+    if wlan.isconnected():
+        print("-" * 40) # Print a separator line
+        print("WiFi Connection Successful!")
+        network_config = wlan.ifconfig() # Get network configuration tuple
+    # network_config contains: (IP Address, Subnet Mask, Gateway, DNS Server)
+        print("Device IP Address:", network_config[0])
+        print("Subnet Mask:", network_config[1])
+        print("Gateway:", network_config[2])
+        print("DNS Server:", network_config[3])
+        print("-" * 40)
+    else:
+        print("-" * 40)
+        print("!!! WiFi Connection Failed !!!")
+        print("Please check:")
+        print("- Correct SSID and Password?")
+        print("- Correct Wi-Fi band (2.4 GHz)?")
+        print("- Wi-Fi signal strength?")
+        print("-" * 40)
+
+
+# --- WORD-BASED WRAPPING FUNCTION ---
+def wrap_text(text, width=16):
+    """Wraps text into lines, breaking only on spaces/words where possible."""
+    lines = []
+    current_line = ""
+    words = text.split(' ') # Split the entire message into a list of words
+
+    for word in words:
+        # Check if adding the next word (plus a space) exceeds the line width
+        # The check only happens if the current line is NOT empty
+        if len(current_line) + len(word) + 1 > width and len(current_line) > 0:
+            # Current line is full, save it and start a new line with the word
+            lines.append(current_line)
+            current_line = word
+        elif len(current_line) == 0:
+            # Start of the first line, or a new line after a wrap
+            current_line = word
+        else:
+            # Add the word (with a preceding space) to the current line
+            current_line += " " + word
+            
+        # This section handles words that are longer than the entire line width (hard wrap those)
+        if len(current_line) > width:
+            # Hard-wrap the excessively long word onto subsequent lines
+            sub_lines = [current_line[i:i + width] for i in range(0, len(current_line), width)]
+            
+            # Save the currently established line, then add all other pieces
+            lines.append(sub_lines[0])
+            lines.extend(sub_lines[1:-1])
+            current_line = sub_lines[-1] # Set the last piece as the new starting line
+
+    # Don't forget to add the last line after the loop finishes
+    if current_line:
+        lines.append(current_line)
+        
+    return lines
+# END OF WRAPPING FUNCTION
+
+
+def get_unique_client_id():
+    """Generates a unique MQTT client ID based on the ESP32's MAC address."""
+    mac = ubinascii.hexlify(network.WLAN().config('mac'), ':').decode()
+    client_id = b"esp32_oled_controller_" + mac.encode('utf-8')
+    return client_id
+
+
+def display_message_and_publish_status(client, new_message):
+    """Displays the message on the OLED and publishes the status."""
+    global current_display_text
+    global current_emotion_bitmap_data # Use the global emotion data
+
+    current_display_text = new_message
+
+# --- Display Logic ---
+    if oled:
+        # 1. Clear the screen
+        oled.fill(0)  
+        
+        # 2. Draw the Current Emotion Bitmap (16x16 at 0, 0)
+        if current_emotion_bitmap_data:
+            # Create a memory-efficient framebuffer for the image
+            fbuf = framebuf.FrameBuffer(
+                bytearray(current_emotion_bitmap_data), 
+                EMOTION_WIDTH, 
+                EMOTION_HEIGHT, 
+                framebuf.MONO_HLSB
+            )
+            # Draw the 16x16 image at (0, 0)
+            oled.blit(fbuf, 0, 0)
+        
+        # 3. Wrap the incoming message (max 16 chars per line)
+        display_lines = wrap_text(new_message, width=16)
+        
+        # 4. Draw each line, STARTING BELOW THE IMAGE
+        # Image is 16 pixels high. Start text 2 pixels below it.
+        y_position = EMOTION_HEIGHT + 2 
+        
+        for line in display_lines:
+            # Check if we are running out of screen space (DISPLAY_HEIGHT=64)
+            if y_position >= DISPLAY_HEIGHT:
+                # Stop if we run out of screen
+                break 
+                
+            # Draw the line at (x=0, y=y_position)
+            oled.text(line, 0, y_position) 
+            
+            # Move down for the next line
+            y_position += LINE_HEIGHT 
+        
+        oled.show()
+        print(f"OLED set to: '{new_message}' (wrapped)")
+    else:
+        print("OLED not initialized, skipping display update.")
+
+# --- Publish Status ---
+    status_message = b"Displayed: " + new_message.encode('utf-8')
+    print(f"Publishing status to {STATUS_TOPIC.decode()}")
+    client.publish(STATUS_TOPIC, status_message, retain=False)
+
+
+# --- MQTT CALLBACK ---
+
+def sub_callback(topic, msg):
+    """Handles incoming MQTT messages on the command or image topic."""
+
+    global mqtt_client
+    global current_emotion_bitmap_data # Update the global data
+    global current_display_text # Need to refer to the current text when redrawing
+
+    decoded_topic = topic.decode()
+    incoming_text = msg.decode().strip()
+
+    print(f"Received command: Topic='{decoded_topic}', Message='{incoming_text}'")
+
+    if topic == COMMAND_TOPIC:
+        # Handle TEXT command
+        if incoming_text:
+            display_message_and_publish_status(mqtt_client, incoming_text)
+        else:
+            # Clear the text area if an empty message is sent (image remains)
+            display_message_and_publish_status(mqtt_client, "")
+            
+    elif topic == IMAGE_TOPIC:
+        # Handle IMAGE command (e.g., "happy", "sad", "clear")
+        new_bitmap = get_emotion_bitmap(incoming_text)
+        if new_bitmap is not None:
+            current_emotion_bitmap_data = new_bitmap
+            print(f"Emotion set to: {incoming_text}")
+            
+            # Immediately refresh the display with the current text and the new image
+            display_message_and_publish_status(mqtt_client, current_display_text) 
+        else:
+            print(f"Unknown emotion command received: {incoming_text}")
+
+
+# --- MAIN EXECUTION ---
+
+# Connect Wi-Fi
+wifi_connect(WIFI_SSID, WIFI_PASSWORD)
+
+
+# Prepare MQTT Client
+client_id = get_unique_client_id()
+print(f"MQTT Client ID: {client_id.decode()}")
+
+try:
+    # Initialize and connect MQTT
+    mqtt_client = MQTTClient(
+        client_id=client_id,
+        server=MQTT_BROKER,
+        port=1883,
+        user=None,
+        password=None,
+        keepalive=60
+    )
+    mqtt_client.set_callback(sub_callback)
+
+    print(f"Connecting to MQTT broker {MQTT_BROKER}...")
+    mqtt_client.connect()
+    print("MQTT connected.")
+
+# Subscribe to the command topic
+    mqtt_client.subscribe(COMMAND_TOPIC)
+    print(f"Subscribed to command topic: {COMMAND_TOPIC.decode()}")
+
+# Subscribe to the new image topic
+    mqtt_client.subscribe(IMAGE_TOPIC)
+    print(f"Subscribed to image topic: {IMAGE_TOPIC.decode()}")
+
+
+# Initial status publication after subscription
+    if oled:
+        # Set an initial message with a blank image
+        current_emotion_bitmap_data = get_emotion_bitmap("neutral") 
+        display_message_and_publish_status(mqtt_client, "Ready for Text!")        #can change for original display after setup
+    else:
+        print("Display not active. Waiting for messages.")
+
+#Main Loop
+    while True:
+# Check for new messages on the subscribed topic
+        mqtt_client.check_msg() 
+        time.sleep(1) # Keep the loop responsive but not overly demanding
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+    print("Attempting to reconnect in 10 seconds...")
+    time.sleep(10)
