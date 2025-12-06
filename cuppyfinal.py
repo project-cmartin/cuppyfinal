@@ -12,7 +12,38 @@ from ssd1306 import SSD1306_I2C
 # --- Define Variables ---
 WIFI_SSID = "YOUR_SSID" # <--- CHANGE THIS
 WIFI_PASSWORD = "YOUR_PASSWORD" # <--- CHANGE THIS
+YOUR_NAME = "UNIQUE_NAME"   # <--- CHANGE THIS (Use your actual name or a unique ID)
 
+MQTT_BROKER = "broker.hivemq.com"
+
+# --- SSD1306 I2C Setup ---
+# Adjust these pins and dimensions based on your specific board and display wiring.
+# Standard 0.96" OLED is typically 128x64 or 128x32. 
+DISPLAY_WIDTH = 128 
+DISPLAY_HEIGHT = 64
+I2C_SCL_PIN = 22 # Example for ESP32
+I2C_SDA_PIN = 21 # Example for ESP32
+
+COMMAND_TOPIC = b"wyohack/" + YOUR_NAME.encode('utf-8') + b"/display/command"
+STATUS_TOPIC = b"wyohack/" + YOUR_NAME.encode('utf-8') + b"/display/status"
+
+# Initialize I2C and OLED Display
+try:
+    i2c = I2C(0, scl=Pin(I2C_SCL_PIN), sda=Pin(I2C_SDA_PIN))
+    oled = SSD1306_I2C(DISPLAY_WIDTH, DISPLAY_HEIGHT, i2c)
+    print("OLED Display Initialized successfully.")
+except Exception as e:
+    print(f"Error initializing OLED: {e}")
+    # You may want to halt execution or run in a limited mode if the display is critical
+    oled = None 
+
+# Initial Display State
+current_display_text = "Waking Up ..."                      #can change for initializing setup display text
+# Display the initial message (if oled object exists)
+if oled:
+    oled.fill(0)  # Clear the screen
+    oled.text(current_display_text, 0, 0)
+    oled.show()
 
 # --- UTILITY FUNCTIONS ---
 
@@ -59,6 +90,69 @@ def wifi_connect(WIFI_SSID, WIFI_PASSWORD):
         print("- Wi-Fi signal strength?")
         print("-" * 40)
 
+def get_unique_client_id():
+    """Generates a unique MQTT client ID based on the ESP32's MAC address."""
+    mac = ubinascii.hexlify(network.WLAN().config('mac'), ':').decode()
+    client_id = b"esp32_oled_controller_" + mac.encode('utf-8')
+    return client_id
+
+LINE_HEIGHT = 10 # 8 pixels for the font + 2 pixels for spacing
+
+def display_message_and_publish_status(client, new_message):
+    """Displays the message on the OLED and publishes the status."""
+    global current_display_text
+
+    current_display_text = new_message
+
+# --- Display Logic ---
+    if oled:
+        # 1. Clear the screen
+        oled.fill(0) 
+        
+        # 2. Wrap the incoming message (max 16 chars per line)
+        display_lines = wrap_text(new_message, width=16)
+        
+        # 3. Draw each line
+        y_position = 0
+        for line in display_lines:
+            # Check if we are running out of screen space (DISPLAY_HEIGHT=64, so max 8 lines)
+            if y_position >= DISPLAY_HEIGHT:
+                # Stop if we run out of screen
+                break 
+                
+            # Draw the line at (x=0, y=y_position)
+            oled.text(line, 0, y_position) 
+            
+            # Move down 8 pixels for the next line
+            y_position += LINE_HEIGHT 
+        
+        oled.show()
+        print(f"OLED set to: '{new_message}' (wrapped)")
+    else:
+        print("OLED not initialized, skipping display update.")
+
+# --- Publish Status ---
+    status_message = b"Displayed: " + new_message.encode('utf-8')
+    print(f"Publishing status to {STATUS_TOPIC.decode()}")
+    client.publish(STATUS_TOPIC, status_message, retain=False) # Retain=False is more suitable for dynamic messages
+
+
+# --- MQTT CALLBACK ---
+
+def sub_callback(topic, msg):
+    """Handles incoming MQTT messages on the command topic."""
+
+    global mqtt_client
+
+    print(f"Received command: Topic='{topic.decode()}', Message='{msg.decode()}'")
+
+    incoming_text = msg.decode().strip()
+
+    if incoming_text:
+        display_message_and_publish_status(mqtt_client, incoming_text)
+    else:
+         # Clear the screen if an empty message is sent
+         display_message_and_publish_status(mqtt_client, "Screen Cleared")
 
 
 
@@ -68,3 +162,43 @@ def wifi_connect(WIFI_SSID, WIFI_PASSWORD):
 wifi_connect(WIFI_SSID, WIFI_PASSWORD)
 
 
+# Prepare MQTT Client
+client_id = get_unique_client_id()
+print(f"MQTT Client ID: {client_id.decode()}")
+
+try:
+    # Initialize and connect MQTT
+    mqtt_client = MQTTClient(
+        client_id=client_id,
+        server=MQTT_BROKER,
+        port=1883,
+        user=None,
+        password=None,
+        keepalive=60
+    )
+    mqtt_client.set_callback(sub_callback)
+
+    print(f"Connecting to MQTT broker {MQTT_BROKER}...")
+    mqtt_client.connect()
+    print("MQTT connected.")
+
+# Subscribe to the command topic
+    mqtt_client.subscribe(COMMAND_TOPIC)
+    print(f"Subscribed to command topic: {COMMAND_TOPIC.decode()}")
+
+# Initial status publication after subscription
+    if oled:
+        display_message_and_publish_status(mqtt_client, "Ready for Text!")         #can change for original display after setup
+    else:
+        print("Display not active. Waiting for messages.")
+
+#Main Loop
+    while True:
+# Check for new messages on the subscribed topic
+        mqtt_client.check_msg() 
+        time.sleep(1) # Keep the loop responsive but not overly demanding
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+    print("Attempting to reconnect in 10 seconds...")
+    time.sleep(10)
