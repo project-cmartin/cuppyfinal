@@ -90,6 +90,47 @@ def wifi_connect(WIFI_SSID, WIFI_PASSWORD):
         print("- Wi-Fi signal strength?")
         print("-" * 40)
 
+
+# --- WORD-BASED WRAPPING FUNCTION ---
+def wrap_text(text, width=16):
+    """Wraps text into lines, breaking only on spaces/words where possible."""
+    lines = []
+    current_line = ""
+    words = text.split(' ') # Split the entire message into a list of words
+
+    for word in words:
+        # Check if adding the next word (plus a space) exceeds the line width
+        # The check only happens if the current line is NOT empty
+        if len(current_line) + len(word) + 1 > width and len(current_line) > 0:
+            # Current line is full, save it and start a new line with the word
+            lines.append(current_line)
+            current_line = word
+        elif len(current_line) == 0:
+            # Start of the first line, or a new line after a wrap
+            current_line = word
+        else:
+            # Add the word (with a preceding space) to the current line
+            current_line += " " + word
+            
+        # This section handles words that are longer than the entire line width (hard wrap those)
+        if len(current_line) > width:
+            # Hard-wrap the excessively long word onto subsequent lines
+            # Note: This is a robust way to handle extremely long words without breaking the program
+            sub_lines = [current_line[i:i + width] for i in range(0, len(current_line), width)]
+            
+            # Save the currently established line, then add all other pieces
+            lines.append(sub_lines[0])
+            lines.extend(sub_lines[1:-1])
+            current_line = sub_lines[-1] # Set the last piece as the new starting line
+
+    # Don't forget to add the last line after the loop finishes
+    if current_line:
+        lines.append(current_line)
+        
+    return lines
+# END OF WRAPPING FUNCTION
+
+
 def get_unique_client_id():
     """Generates a unique MQTT client ID based on the ESP32's MAC address."""
     mac = ubinascii.hexlify(network.WLAN().config('mac'), ':').decode()
